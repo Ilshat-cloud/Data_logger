@@ -1,13 +1,9 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_mac.h"
-#include "esp_wifi.h"
-#include "esp_event.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
-#include "lwip/err.h"
-#include "lwip/sys.h"
+
 #include <stdio.h>
 #include <string.h>
 #include "esp_log.h"
@@ -16,6 +12,8 @@
 #include "driver/spi_common.h"
 #include "sdmmc_cmd.h"
 #include <dirent.h>
+
+#include "inc/wifi.h"
 
 static const char *TAG2 = "SD_FATFS";
 
@@ -32,86 +30,72 @@ static const char *TAG2 = "SD_FATFS";
    If you'd rather not, just change the below entries to strings with
    the config you want - ie #define EXAMPLE_WIFI_SSID "mywifissid"
 */
-#define EXAMPLE_ESP_WIFI_SSID      CONFIG_ESP_WIFI_SSID
-#define EXAMPLE_ESP_WIFI_PASS      CONFIG_ESP_WIFI_PASSWORD
-#define EXAMPLE_ESP_WIFI_CHANNEL   CONFIG_ESP_WIFI_CHANNEL
-#define EXAMPLE_MAX_STA_CONN       CONFIG_ESP_MAX_STA_CONN
+typedef struct {
+    uint32_t timestamp;
+    uint32_t pin_states;
+} log_item_t;
 
-#if CONFIG_ESP_GTK_REKEYING_ENABLE
-#define EXAMPLE_GTK_REKEY_INTERVAL CONFIG_ESP_GTK_REKEY_INTERVAL
-#else
-#define EXAMPLE_GTK_REKEY_INTERVAL 0
-#endif
-
+#define QUEUE_SIZE 2000
+#define BATCH_SIZE 1000
+QueueHandle_t log_queue = NULL;
 
 esp_err_t sd_card(void);
 
-static const char *TAG = "wifi softAP";
+// --- 1. Задача сбора данных (вызывается каждую 1 мс, например через таймер или высокоприоритетную задачу) ---
+void collect_data_task(void *pvParameters) {
 
-static void wifi_event_handler(void* arg, esp_event_base_t event_base,
-                                    int32_t event_id, void* event_data)
-{
-    if (event_id == WIFI_EVENT_AP_STACONNECTED) {
-        wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
-        ESP_LOGI(TAG, "station "MACSTR" join, AID=%d",
-                 MAC2STR(event->mac), event->aid);
-    } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
-        wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
-        ESP_LOGI(TAG, "station "MACSTR" leave, AID=%d, reason=%d",
-                 MAC2STR(event->mac), event->aid, event->reason);
+    while (1) {
+        log_item_t item;
+        item.timestamp = xTaskGetTickCount() ; // Время в мс от старта
+        item.pin_states = 666;
+
+        // Пытаемся закинуть в очередь. Если очередь забита (например, SD-карта зависла),
+        // используем таймаут 0, чтобы не заблокировать прерывание/опрос в 1 мс.
+        if (xQueueSend(log_queue, &item, 0) != pdPASS) {
+            // Очередь переполнена! Можно инкрементировать счетчик пропущенных точек
+            vTaskDelay(10); // Немного подождем, чтобы флшка успела отработать
+        }
+
+        vTaskDelay(1);
     }
 }
 
-void wifi_init_softap(void)
-{
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_ap();
+// --- 2. Фоновая задача записи на SD-карту ---
+void sd_writer_task(void *pvParameters) {
+    static log_item_t batch[BATCH_SIZE];
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_LOGI(TAG2, "Фоновый писатель запущен, ждем накопления %d элементов...", BATCH_SIZE);
 
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &wifi_event_handler,
-                                                        NULL,
-                                                        NULL));
+    while (1) {
+        // Проверяем: накопилось ли в очереди достаточное количество данных?
+        if (uxQueueMessagesWaiting(log_queue) >= BATCH_SIZE) {
+            
+            // Выгребаем ровно BATCH_SIZE элементов из очереди
+            for (int i = 0; i < BATCH_SIZE; i++) {
+                xQueueReceive(log_queue, &batch[i], 0);
+            }
 
-    wifi_config_t wifi_config = {
-        .ap = {
-            .ssid = EXAMPLE_ESP_WIFI_SSID,
-            .ssid_len = strlen(EXAMPLE_ESP_WIFI_SSID),
-            .channel = EXAMPLE_ESP_WIFI_CHANNEL,
-            .password = EXAMPLE_ESP_WIFI_PASS,
-            .max_connection = EXAMPLE_MAX_STA_CONN,
-#ifdef CONFIG_ESP_WIFI_SOFTAP_SAE_SUPPORT
-            .authmode = WIFI_AUTH_WPA3_PSK,
-            .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
-#else /* CONFIG_ESP_WIFI_SOFTAP_SAE_SUPPORT */
-            .authmode = WIFI_AUTH_WPA2_PSK,
-#endif
-            .pmf_cfg = {
-                    .required = true,
-            },
-#ifdef CONFIG_ESP_WIFI_BSS_MAX_IDLE_SUPPORT
-            .bss_max_idle_cfg = {
-                .period = WIFI_AP_DEFAULT_MAX_IDLE_PERIOD,
-                .protected_keep_alive = 1,
-            },
-#endif
-            .gtk_rekey_interval = EXAMPLE_GTK_REKEY_INTERVAL,
-        },
-    };
-    if (strlen(EXAMPLE_ESP_WIFI_PASS) == 0) {
-        wifi_config.ap.authmode = WIFI_AUTH_OPEN;
+            // Открываем файл под каждую запись
+            FILE *f = fopen("/sdcard/datalog.bin", "ab");
+            if (f == NULL) {
+                ESP_LOGE(TAG2, "Не удалось открыть файл для записи!");
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+
+            // Записываем пачку
+            size_t written = fwrite(batch, sizeof(log_item_t), BATCH_SIZE, f);
+            
+            // Сбрасываем кэш и закрываем файл, чтобы размер сразу обновился на флешке!
+            fflush(f);
+            fclose(f);
+
+            ESP_LOGI(TAG2, "Записана пачка из %d элементов (%d байт) и файл закрыт", written, BATCH_SIZE * sizeof(log_item_t));
+        } else {
+            // Если данных мало — спим 50 мс
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
     }
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "wifi_init_softap finished. SSID:%s password:%s channel:%d",
-             EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS, EXAMPLE_ESP_WIFI_CHANNEL);
 }
 
 void app_main(void)
@@ -124,9 +108,21 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    ESP_LOGI(TAG, "ESP_WIFI_MODE_AP");
     wifi_init_softap();
     ESP_ERROR_CHECK(sd_card());
+
+    // 1. Создаем очередь на 2000 элементов
+    log_queue = xQueueCreate(QUEUE_SIZE, sizeof(log_item_t));
+    if (log_queue == NULL) {
+        ESP_LOGE(TAG2, "Ошибка: не удалось создать очередь логов!");
+        return;
+    }
+
+    // 2. Создаем задачу сбора данных (стек 2048 байт, приоритет 5 - повыше)
+    xTaskCreate(collect_data_task, "collect_data_task", 2048, NULL, 5, NULL);
+
+    // 3. Создаем задачу записи на SD-карту (стек 20000 байт, т.к. работа с файлами требует больше памяти, приоритет 3)
+    xTaskCreate(sd_writer_task, "sd_writer_task", 30000, NULL, 3, NULL);
 }
 
 
@@ -185,7 +181,7 @@ esp_err_t sd_card(void){
     // Открываем корневую папку монтирования
     DIR *dir = opendir(MOUNT_POINT);
     if (dir == NULL) {
-        ESP_LOGE(TAG, "Не удалось открыть каталог для чтения!");
+        ESP_LOGE(TAG2, "Не удалось открыть каталог для чтения!");
     }else{
         struct dirent *entry;
         int file_count = 0;
@@ -196,16 +192,16 @@ esp_err_t sd_card(void){
             // entry->d_name — имя файла или папки
             // entry->d_type может подсказать тип (DT_DIR для папки, DT_REG для файла)
             if (entry->d_type == DT_DIR) {
-                ESP_LOGI(TAG, "  [DIR]  %s", entry->d_name);
+                ESP_LOGI(TAG2, "  [DIR]  %s", entry->d_name);
             } else {
-                ESP_LOGI(TAG, "  [FILE] %s", entry->d_name);
+                ESP_LOGI(TAG2, "  [FILE] %s", entry->d_name);
             }
         }
 
         // Обязательно закрываем директорию после чтения, чтобы не было утечки памяти/дескрипторов
         closedir(dir);
 
-        ESP_LOGI(TAG, "Всего элементов: %d", file_count);  
+        ESP_LOGI(TAG2, "Всего элементов: %d", file_count);  
     }
 
     // --- Проверка записи в файл ---
