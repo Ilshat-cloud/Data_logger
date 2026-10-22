@@ -191,8 +191,9 @@ void tcp_server_task(void *pvParameters)
                     is_logging_active = true;
                     ESP_LOGI(TAG, "-> START RECORDING to file: %s", active_filename);
                     
-                    const char *resp = "OK: START_WRITE\n";
-                    send(client_sock, resp, strlen(resp), 0);
+                    char resp_buf[128];
+                    int len = snprintf(resp_buf, sizeof(resp_buf), "OK: START_WRITE:%s\n", active_filename);
+                    send(client_sock, resp_buf, len, 0);
                 } 
                 else if (strcmp(rx_buffer, "StopWrite") == 0) {
                     is_logging_active = false;
@@ -263,9 +264,22 @@ void tcp_server_task(void *pvParameters)
                     // Небольшая задержка перед возможным возобновлением работы
                     vTaskDelay(pdMS_TO_TICKS(100));
                 }
+                else if (strcmp(rx_buffer, "?") == 0 || strcasecmp(rx_buffer, "help") == 0) {
+                    ESP_LOGI(TAG, "-> COMMAND Help requested");
+                    const char *help_msg = 
+                        "=== AVAILABLE COMMANDS ===\n"
+                        "StartWrite [filename] - Start logging data to SD card\n"
+                        "StopWrite              - Stop current logging session\n"
+                        "LS                     - List files and directories\n"
+                        "Status                 - Show system and SD card status\n"
+                        "Download [filename]    - Download binary log file\n"
+                        "? / help               - Show this help message\n"
+                        "==========================\n";
+                    send(client_sock, help_msg, strlen(help_msg), 0);
+                }
                 else
                 {
-                    const char *resp = "ERROR: UNKNOWN_COMMAND\n";
+                    const char *resp = "ERROR: UNKNOWN_COMMAND type ? or help \n";
                     send(client_sock, resp, strlen(resp), 0);
                 }
 

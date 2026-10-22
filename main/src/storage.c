@@ -20,64 +20,85 @@ void collect_data_task(void *pvParameters) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-        log_item_t item;
-        item.timestamp = xTaskGetTickCount() ; // Время в мс от старта
-        item.pin_states = 666;
+        //TODO пишем в очередь из прерывания, сюда мы можем писать АЦП в будущем
 
-        // Пытаемся закинуть в очередь. Если очередь забита (например, SD-карта зависла),
-        // используем таймаут 0, чтобы не заблокировать прерывание/опрос в 1 мс.
-        if (xQueueSend(log_queue, &item, 0) != pdPASS) {
-            // Очередь переполнена! Можно инкрементировать счетчик пропущенных точек
-            vTaskDelay(10); // Немного подождем, чтобы флшка успела отработать
-        }
+        // // Пытаемся закинуть в очередь. Если очередь забита (например, SD-карта зависла),
+        // // используем таймаут 0, чтобы не заблокировать прерывание/опрос в 1 мс.
+        // if (xQueueSend(log_queue, &item, 0) != pdPASS) {
+        //     // Очередь переполнена! Можно инкрементировать счетчик пропущенных точек
+        //     vTaskDelay(10); // Немного подождем, чтобы флшка успела отработать
+        // }
 
-        vTaskDelay(1);
+        vTaskDelay(100);
     }
 }
 
 // --- 2. Фоновая задача записи на SD-карту ---
 void sd_writer_task(void *pvParameters) {
     static log_item_t batch[BATCH_SIZE];
-
+    TickType_t last_write_time = xTaskGetTickCount(); // Таймер последней записи
     ESP_LOGI(TAG2, "Фоновый писатель запущен, ждем накопления %d элементов...", BATCH_SIZE);
-
+    bool last_pin_state = gpio_get_level(PIN_I2C_SCL);
     
     while (1) {
+        gpio_set_level(PIN_LED_2, is_logging_active);
+       
+        //кнопка начала записи, времянка
+        bool current_pin_state = gpio_get_level(PIN_I2C_SCL);
+        if ((current_pin_state != last_pin_state)&&(current_pin_state == 1)) { // 
+                // Кнопка нажата (улетело в 0, т.к. замыкает на землю)
+                is_logging_active = !is_logging_active; // Инвертируем статус
+                if (is_logging_active) {
+                    ESP_LOGI("BTN", ">>> ЗАПИСЬ СТАРТОВАЛА (нажали BOOT) <<<");
+                } else {
+                     ESP_LOGI("BTN", ">>> ЗАПИСЬ ОСТАНОВЛЕНА (нажали BOOT) <<<");
+                } 
+        }
+        last_pin_state = current_pin_state; 
 
         if (!is_logging_active) {
             
             vTaskDelay(pdMS_TO_TICKS(100));
             xQueueReset(log_queue);
+            last_write_time = xTaskGetTickCount();
             continue;
         }
+        TickType_t current_time = xTaskGetTickCount();
+        UBaseType_t messages_waiting = uxQueueMessagesWaiting(log_queue);
+
+        // Условия для записи:
+        // 1. Накопился полный пакет (BATCH_SIZE)
+        // 2. ИЛИ в очереди есть элементы (> 0) И прошло >= 2 секунд с момента последней записи
+        bool time_elapsed = (current_time - last_write_time) >= pdMS_TO_TICKS(2000);
 
         // Проверяем: накопилось ли в очереди достаточное количество данных?
-        if (uxQueueMessagesWaiting(log_queue) >= BATCH_SIZE) {
+        if ((messages_waiting >= BATCH_SIZE) || (messages_waiting > 0 && time_elapsed)) {
             
-            // Выгребаем ровно BATCH_SIZE элементов из очереди
-            for (int i = 0; i < BATCH_SIZE; i++) {
-                xQueueReceive(log_queue, &batch[i], 0);
+            int items_to_read = 0;
+            while (items_to_read < BATCH_SIZE && xQueueReceive(log_queue, &batch[items_to_read], 0) == pdPASS) {
+                items_to_read++;
             }
+            if (items_to_read > 0) {
+                // Открываем файл под каждую запись
+                FILE *f = fopen(active_filename, "ab");
+                if (f == NULL) {
+                    ESP_LOGE(TAG2, "Не удалось открыть файл для записи!");
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    continue;
+                }
 
-            // Открываем файл под каждую запись
-            FILE *f = fopen(active_filename, "ab");
-            if (f == NULL) {
-                ESP_LOGE(TAG2, "Не удалось открыть файл для записи!");
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                continue;
+                // Записываем пачку
+                size_t written = fwrite(batch, sizeof(log_item_t), items_to_read, f);
+                
+                // Сбрасываем кэш и закрываем файл, чтобы размер сразу обновился на флешке!
+                fflush(f);
+                fclose(f);
+                last_write_time = xTaskGetTickCount();
+                ESP_LOGI(TAG2, "Записана пачка из %d элементов (%d байт) и файл закрыт", written, written * sizeof(log_item_t));
             }
-
-            // Записываем пачку
-            size_t written = fwrite(batch, sizeof(log_item_t), BATCH_SIZE, f);
-            
-            // Сбрасываем кэш и закрываем файл, чтобы размер сразу обновился на флешке!
-            fflush(f);
-            fclose(f);
-
-            ESP_LOGI(TAG2, "Записана пачка из %d элементов (%d байт) и файл закрыт", written, BATCH_SIZE * sizeof(log_item_t));
         } else {
-            // Если данных мало — спим 50 мс
-            vTaskDelay(pdMS_TO_TICKS(50));
+            // Если данных мало — спим 10 мс
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
 }
